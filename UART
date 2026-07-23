@@ -1,0 +1,474 @@
+1. DESIGN FILES
+baud_gen.sv
+Verilog
+module baud_gen #(
+    parameter CLK_FREQ  = 50000000,
+    parameter BAUD_RATE = 9600
+)(
+    input  wire clk,
+    input  wire reset,
+    output reg  baud_clk
+);
+
+    localparam integer COUNT_MAX = CLK_FREQ / (BAUD_RATE * 16);
+    integer count;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            count    <= 0;
+            baud_clk <= 0;
+        end else begin
+            if (count == COUNT_MAX - 1) begin
+                count    <= 0;
+                baud_clk <= ~baud_clk;
+            end else begin
+                count    <= count + 1;
+            end
+        end
+    end
+
+endmodule
+uart_tx.sv
+Verilog
+module uart_tx #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire                  clk,
+    input  wire                  reset,
+    input  wire                  tx_start,
+    input  wire [DATA_WIDTH-1:0] tx_data,
+    output reg                   tx,
+    output reg                   tx_done
+);
+
+    typedef enum logic [1:0] {
+        IDLE  = 2'b00,
+        START = 2'b01,
+        DATA  = 2'b10,
+        STOP  = 2'b11
+    } state_t;
+
+    state_t state;
+    integer bit_index;
+    reg [DATA_WIDTH-1:0] tx_shift_reg;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state        <= IDLE;
+            tx           <= 1'b1;
+            tx_done      <= 1'b0;
+            bit_index    <= 0;
+            tx_shift_reg <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    tx      <= 1'b1;
+                    tx_done <= 1'b0;
+                    if (tx_start) begin
+                        tx_shift_reg <= tx_data;
+                        state        <= START;
+                    end
+                end
+
+                START: begin
+                    tx    <= 1'b0;
+                    state <= DATA;
+                end
+
+                DATA: begin
+                    tx <= tx_shift_reg[bit_index];
+                    if (bit_index == DATA_WIDTH - 1) begin
+                        bit_index <= 0;
+                        state     <= STOP;
+                    end else begin
+                        bit_index <= bit_index + 1;
+                    end
+                end
+
+                STOP: begin
+                    tx      <= 1'b1;
+                    tx_done <= 1'b1;
+                    state   <= IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+uart_rx.sv
+Verilog
+module uart_rx #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire                  clk,
+    input  wire                  reset,
+    input  wire                  rx,
+    output reg  [DATA_WIDTH-1:0] rx_data,
+    output reg                   rx_done,
+    output reg                   parity_error,
+    output reg                   framing_error
+);
+
+    typedef enum logic [1:0] {
+        IDLE  = 2'b00,
+        START = 2'b01,
+        DATA  = 2'b10,
+        STOP  = 2'b11
+    } state_t;
+
+    state_t state;
+    integer bit_index;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            state         <= IDLE;
+            rx_data       <= 0;
+            rx_done       <= 1'b0;
+            parity_error  <= 1'b0;
+            framing_error <= 1'b0;
+            bit_index     <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    rx_done <= 1'b0;
+                    if (!rx) begin
+                        state <= START;
+                    end
+                end
+
+                START: begin
+                    state <= DATA;
+                end
+
+                DATA: begin
+                    rx_data[bit_index] <= rx;
+                    if (bit_index == DATA_WIDTH - 1) begin
+                        bit_index <= 0;
+                        state     <= STOP;
+                    end else begin
+                        bit_index <= bit_index + 1;
+                    end
+                end
+
+                STOP: begin
+                    if (rx == 1'b1) begin
+                        rx_done       <= 1'b1;
+                        framing_error <= 1'b0;
+                    end else begin
+                        framing_error <= 1'b1;
+                    end
+                    state <= IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+uart_top.sv
+Verilog
+module uart_top #(
+    parameter DATA_WIDTH = 8
+)(
+    input  wire                  clk,
+    input  wire                  reset,
+    input  wire                  tx_start,
+    input  wire [DATA_WIDTH-1:0] tx_data,
+    output wire [DATA_WIDTH-1:0] rx_data,
+    output wire                  tx_done,
+    output wire                  rx_done,
+    output wire                  parity_error,
+    output wire                  framing_error
+);
+
+    wire baud_clk;
+    wire loopback_line;
+
+    baud_gen bg_inst (
+        .clk(clk),
+        .reset(reset),
+        .baud_clk(baud_clk)
+    );
+
+    uart_tx #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) tx_inst (
+        .clk(baud_clk),
+        .reset(reset),
+        .tx_start(tx_start),
+        .tx_data(tx_data),
+        .tx(loopback_line),
+        .tx_done(tx_done)
+    );
+
+    uart_rx #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) rx_inst (
+        .clk(baud_clk),
+        .reset(reset),
+        .rx(loopback_line),
+        .rx_data(rx_data),
+        .rx_done(rx_done),
+        .parity_error(parity_error),
+        .framing_error(framing_error)
+    );
+
+endmodule
+design.sv
+Verilog
+// Design Includes
+`include "baud_gen.sv"
+`include "uart_tx.sv"
+`include "uart_rx.sv"
+`include "uart_top.sv"
+2. TESTBENCH FILES
+uart_if.sv
+Verilog
+interface uart_if(input logic clk, input logic reset);
+    logic        tx_start;
+    logic [7:0]  tx_data;
+    logic [7:0]  rx_data;
+    logic        tx_done;
+    logic        rx_done;
+    logic        parity_error;
+    logic        framing_error;
+endinterface
+transaction.sv
+Verilog
+class transaction;
+    rand bit [7:0] tx_data;
+    bit [7:0]      rx_data;
+    bit            tx_done;
+    bit            rx_done;
+    bit            parity_error;
+    bit            framing_error;
+
+    function void display(string name);
+        $display("-----------------------------------------");
+        $display("[%s] TX DATA        = %h", name, tx_data);
+        $display("     RX DATA        = %h", name, rx_data);
+        $display("     TX DONE        = %b", name, tx_done);
+        $display("     RX DONE        = %b", name, rx_done);
+        $display("     PARITY ERROR   = %b", name, parity_error);
+        $display("     FRAMING ERROR  = %b", name, framing_error);
+        $display("-----------------------------------------");
+    endfunction
+endclass
+generator.sv
+Verilog
+class generator;
+    transaction tr;
+    mailbox gen2drv;
+
+    function new(mailbox gen2drv);
+        this.gen2drv = gen2drv;
+    endfunction
+
+    task run();
+        repeat(20) begin
+            tr = new();
+            if (!tr.randomize()) $error("Randomization Failed");
+            tr.display("GENERATOR");
+            gen2drv.put(tr);
+        end
+    endtask
+endclass
+driver.sv
+Verilog
+class driver;
+    virtual uart_if vif;
+    mailbox gen2drv;
+    transaction tr;
+
+    function new(virtual uart_if vif, mailbox gen2drv);
+        this.vif     = vif;
+        this.gen2drv = gen2drv;
+    endfunction
+
+    task reset();
+        vif.tx_start      <= 0;
+        vif.tx_data       <= 0;
+        $display("--------------------------------");
+        $display(" DRIVER : RESET COMPLETED ");
+        $display("--------------------------------");
+    endtask
+
+    task run();
+        forever begin
+            gen2drv.get(tr);
+            vif.tx_start <= 1'b1;
+            vif.tx_data  <= tr.tx_data;
+            @(posedge vif.clk);
+            vif.tx_start <= 1'b0;
+            
+            // Wait for transmission to finish
+            wait(vif.tx_done == 1'b1);
+            @(posedge vif.clk);
+        end
+    endtask
+endclass
+monitor.sv
+Verilog
+class monitor;
+    virtual uart_if vif;
+    mailbox mon2scb;
+    transaction tr;
+
+    function new(virtual uart_if vif, mailbox mon2scb);
+        this.vif     = vif;
+        this.mon2scb = mon2scb;
+    endfunction
+
+    task run();
+        forever begin
+            tr = new();
+            wait(vif.rx_done == 1'b1);
+            tr.rx_data       = vif.rx_data;
+            tr.rx_done       = vif.rx_done;
+            tr.parity_error  = vif.parity_error;
+            tr.framing_error = vif.framing_error;
+            mon2scb.put(tr);
+            @(posedge vif.clk);
+        end
+    endtask
+endclass
+scoreboard.sv
+Verilog
+class scoreboard;
+    mailbox mon2scb;
+    transaction tr;
+
+    function new(mailbox mon2scb);
+        this.mon2scb = mon2scb;
+    endfunction
+
+    task run();
+        forever begin
+            mon2scb.get(tr);
+            tr.display("SCOREBOARD");
+        end
+    endtask
+endclass
+environment.sv
+Verilog
+class environment;
+    generator  gen;
+    driver     drv;
+    monitor    mon;
+    scoreboard scb;
+
+    mailbox gen2drv;
+    mailbox mon2scb;
+
+    virtual uart_if vif;
+
+    function new(virtual uart_if vif);
+        this.vif = vif;
+        gen2drv  = new();
+        mon2scb  = new();
+
+        gen = new(gen2drv);
+        drv = new(vif, gen2drv);
+        mon = new(vif, mon2scb);
+        scb = new(mon2scb);
+    endfunction
+
+    task test();
+        fork
+            gen.run();
+            drv.run();
+            mon.run();
+            scb.run();
+        join_any
+    endtask
+
+    task run();
+        drv.reset();
+        test();
+    endtask
+endclass
+test.sv
+Verilog
+class test;
+    environment env;
+
+    function new(virtual uart_if vif);
+        env = new(vif);
+    endfunction
+
+    task run();
+        $display("------------------------------------------");
+        $display(" UART TEST STARTED ");
+        $display("------------------------------------------");
+        env.run();
+    endtask
+endclass
+tb_top.sv
+Verilog
+module tb_top;
+
+    logic clk;
+    logic reset;
+
+    // Clock Generation
+    initial begin
+        clk = 0;
+        forever #10 clk = ~clk;
+    end
+
+    // Reset Generation
+    initial begin
+        reset = 1;
+        #20 reset = 0;
+    end
+
+    // Interface Instance
+    uart_if vif(clk, reset);
+
+    // DUT Instance
+    uart_top DUT (
+        .clk(vif.clk),
+        .reset(vif.reset),
+        .tx_start(vif.tx_start),
+        .tx_data(vif.tx_data),
+        .rx_data(vif.rx_data),
+        .tx_done(vif.tx_done),
+        .rx_done(vif.rx_done),
+        .parity_error(vif.parity_error),
+        .framing_error(vif.framing_error)
+    );
+
+    // Test Instance
+    test t;
+
+    // Waveform Dump
+    initial begin
+        $dumpfile("uart.vcd");
+        $dumpvars(0, tb_top);
+    end
+
+    // Start Test
+    initial begin
+        t = new(vif);
+        t.run();
+    end
+
+    // Safety Timeout
+    initial begin
+        #10ms;
+        $display("Error: Simulation Timeout!");
+        $finish;
+    end
+
+endmodule
+testbench.sv
+Verilog
+// Testbench Includes
+`include "uart_if.sv"
+`include "transaction.sv"
+`include "generator.sv"
+`include "driver.sv"
+`include "monitor.sv"
+`include "scoreboard.sv"
+`include "environment.sv"
+`include "test.sv"
+`include "tb_top.sv"
